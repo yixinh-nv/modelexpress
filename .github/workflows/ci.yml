@@ -99,6 +99,87 @@ jobs:
     - name: Run doc tests
       run: cargo test --doc
 
+  helm-verify:
+    name: Helm Chart Verify
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # Pinned: the get-helm-3 script resolves helm-latest-version, so an
+    # unpinned install silently follows major releases.
+    - name: Install Helm
+      run: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
+          | DESIRED_VERSION=v3.16.4 bash
+
+    - name: Lint the chart against every shipped values file
+      run: |
+        helm lint helm/
+        for f in helm/values-production.yaml helm/values-development.yaml \
+                 helm/values-local-storage.yaml helm/test-values.yaml; do
+          echo "== $f"
+          helm lint helm/ -f "$f"
+        done
+
+    # The monitoring.coreos.com resources are capability-gated, so both states
+    # have to be exercised. These assert on rendered CONTENT rather than exit
+    # status: a gate stuck permanently false still exits 0, so a bare
+    # `helm template > /dev/null` would pass forever without proving anything.
+    - name: Render without the Prometheus Operator CRDs
+      run: |
+        helm template mx helm/ > /tmp/plain.yaml
+        grep -q "kind: Deployment" /tmp/plain.yaml
+        ! grep -q "monitoring.coreos.com" /tmp/plain.yaml
+
+    - name: Reject Operator resources when the CRDs are absent
+      run: |
+        if helm template mx helm/ --set metrics.podMonitor.enabled=true 2>/dev/null; then
+          echo "expected a failure: a PodMonitor was rendered with no CRD available"
+          exit 1
+        fi
+
+    - name: Render with the Prometheus Operator CRDs
+      run: |
+        helm template mx helm/ \
+          --api-versions monitoring.coreos.com/v1 \
+          --set metrics.podMonitor.enabled=true \
+          --set metrics.rules.enabled=true \
+          --set metrics.rules.client=true \
+          --set metrics.dashboard.enabled=true \
+          --set metrics.clientPodMonitor.enabled=true \
+          --set metrics.clientPodMonitor.selector.matchLabels.app=mx-vllm \
+          > /tmp/operator.yaml
+        grep -q "kind: PodMonitor" /tmp/operator.yaml
+        grep -q "kind: PrometheusRule" /tmp/operator.yaml
+        grep -q "mx-vllm" /tmp/operator.yaml
+        grep -q "grafana_dashboard" /tmp/operator.yaml
+
+    - name: Reject a client PodMonitor with no selector
+      run: |
+        if helm template mx helm/ \
+             --api-versions monitoring.coreos.com/v1 \
+             --set metrics.clientPodMonitor.enabled=true 2>/dev/null; then
+          echo "expected a failure: an empty selector matches every pod in the namespace"
+          exit 1
+        fi
+
+    - name: Check the rendered alerting rules with promtool
+      run: |
+        PROM=prometheus-3.1.0.linux-amd64
+        curl -sSL -o /tmp/prom.tar.gz \
+          "https://github.com/prometheus/prometheus/releases/download/v3.1.0/${PROM}.tar.gz"
+        tar -xzf /tmp/prom.tar.gz -C /tmp
+        helm template mx helm/ \
+          --api-versions monitoring.coreos.com/v1 \
+          --set metrics.rules.enabled=true \
+          --set metrics.rules.client=true \
+          --show-only templates/prometheusrule.yaml \
+          | python3 -c "import sys,yaml,json; print(yaml.safe_dump(yaml.safe_load(sys.stdin)['spec']))" \
+          > /tmp/rules.yaml
+        /tmp/${PROM}/promtool check rules /tmp/rules.yaml
+
   tls-feature-matrix:
     name: TLS Feature Matrix
     runs-on: ubuntu-latest
