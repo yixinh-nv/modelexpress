@@ -72,3 +72,8 @@ docs/troubleshooting_*.md
 docs/trtllm_*.md
 docs/weight_correctness_*.md
 docs/CONTEXT.md
+
+# Rendered from templates/prometheusrule.yaml so promtool can unit-test the
+# alerts. Generated, never authored -- the thresholds are templated, so a
+# committed copy would go stale the moment a default changes.
+helm/tests/rules.yaml

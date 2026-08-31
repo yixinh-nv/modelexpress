@@ -102,10 +102,14 @@ jobs:
   helm-verify:
     name: Helm Chart Verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        persist-credentials: false
 
     # Pinned: the get-helm-3 script resolves helm-latest-version, so an
     # unpinned install silently follows major releases.
@@ -165,7 +169,15 @@ jobs:
           exit 1
         fi
 
-    - name: Check the rendered alerting rules with promtool
+    # Two different claims, both needed. `check rules` parses the PromQL, which
+    # catches the malformed expressions review reliably misses. `test rules`
+    # drives synthetic series through them and asserts the transition to firing,
+    # which is what catches an alert that is syntactically perfect and cannot
+    # fire -- three of these shipped that way in an earlier draft.
+    #
+    # The rules land in helm/tests/ because promtool resolves rule_files
+    # relative to the test file, not the working directory.
+    - name: Check and unit-test the rendered alerting rules
       run: |
         PROM=prometheus-3.1.0.linux-amd64
         curl -sSL -o /tmp/prom.tar.gz \
@@ -177,8 +189,9 @@ jobs:
           --set metrics.rules.client=true \
           --show-only templates/prometheusrule.yaml \
           | python3 -c "import sys,yaml,json; print(yaml.safe_dump(yaml.safe_load(sys.stdin)['spec']))" \
-          > /tmp/rules.yaml
-        /tmp/${PROM}/promtool check rules /tmp/rules.yaml
+          > helm/tests/rules.yaml
+        /tmp/${PROM}/promtool check rules helm/tests/rules.yaml
+        /tmp/${PROM}/promtool test rules helm/tests/alert_rules_test.yaml
 
   tls-feature-matrix:
     name: TLS Feature Matrix
