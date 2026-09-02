@@ -3,6 +3,7 @@
 
 import logging
 import logging.handlers
+import re
 from unittest.mock import Mock, patch
 
 from modelexpress import configure_trtllm_logging
@@ -212,3 +213,57 @@ def test_cleanup_releases_all_resources_when_shutdown_fails(monkeypatch):
     manager.shutdown.assert_called_once_with()
     assert context.nixl_manager is None
     context.mx_client.close.assert_called_once_with()
+
+
+def test_loader_records_the_load_and_its_single_phase(monkeypatch):
+    """TRT-LLM's tier coverage, which no CI image can exercise.
+
+    CI builds worker images for vllm, sglang, sglang-mooncake and dynamo-vllm --
+    none for TRT-LLM -- so unlike the other two engines this path has never run
+    on a GPU. What can be checked without one is the part written here: that a
+    load records L0 once, records exactly the ``chain`` phase, and labels both
+    with the model the context carries.
+
+    Asserting the phase SET rather than only its presence. TRT-LLM receives a
+    built model and publishes from a separate call the engine makes later,
+    outside this window. A future edit adding model_init or publish here would
+    put time outside the L0 span it claims to partition, and this is the test
+    that would catch it.
+    """
+    from prometheus_client import CollectorRegistry, generate_latest
+
+    from modelexpress.metrics import MetricsCollector
+
+    monkeypatch.setenv("MX_METRICS_ENABLED", "1")
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+    collector = MetricsCollector(registry=CollectorRegistry())
+    monkeypatch.setattr("modelexpress.engines.trtllm.loader.metrics", collector)
+
+    context = Mock()
+    context.adapter.rdma_loaded = True
+    context.adapter.rdma_transform_protocol_version = 1
+    context.adapter.current_model = None
+    context.identity.model_name = "org/trtllm-model"
+    model = Mock()
+
+    monkeypatch.setattr(
+        "modelexpress.engines.trtllm.loader.build_trtllm_load_context",
+        lambda **kwargs: context,
+    )
+    monkeypatch.setattr(
+        "modelexpress.engines.trtllm.loader.LoadStrategyChain.run",
+        Mock(return_value=model),
+    )
+
+    MxModelLoader(**_loader_kwargs()).load_model(model)
+
+    exposition = generate_latest(collector._exposition_registry()).decode()
+    assert (
+        'mx_load_seconds_count{engine="trtllm",model="org/trtllm-model",'
+        'model_role="main",outcome="success",scheme=""} 1.0'
+    ) in exposition, exposition
+
+    phases = set(
+        re.findall(r'mx_load_phase_seconds_count\{[^}]*phase="([^"]+)"', exposition)
+    )
+    assert phases == {"chain"}, phases
